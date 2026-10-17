@@ -1,0 +1,213 @@
+/**
+ * useBootstrap — Fetches initial data when the SPA mounts.
+ */
+
+import { useEffect, useState, useCallback } from 'react';
+import { readProSpaConfig, type ProSpaRuntime } from '../api/config';
+import { useCommandStore } from '../stores/commandStore';
+import { useModelStore } from '../stores/modelStore';
+import { useUIStore } from '../stores/uiStore';
+
+export interface BootstrapResult {
+	loading: boolean;
+	error: string | null;
+	runtime: ProSpaRuntime | null;
+}
+
+export function useBootstrap(): BootstrapResult {
+	const [ loading, setLoading ] = useState< boolean >( true );
+	const [ error, setError ] = useState< string | null >( null );
+	const [ runtime, setRuntime ] = useState< ProSpaRuntime | null >( null );
+
+	const setCommands = useCommandStore( ( s ) => s.setCommands );
+	const setAvailableModels = useModelStore( ( s ) => s.setAvailableModels );
+	const setAvailableProfiles = useModelStore( ( s ) => s.setAvailableProfiles );
+
+	const bootstrap = useCallback( () => {
+		const config = readProSpaConfig();
+		if ( ! config ) {
+			setError( 'Configuration not found. Ensure the admin page is correctly enqueued.' );
+			setLoading( false );
+			return;
+		}
+		setRuntime( config );
+
+		// Seed the model selection from the pre-loaded assistant config.
+		// The sidebar normally syncs the model store when an assistant is
+		// selected, but embedded instances (show_sidebar="0") never render
+		// it — without this, every chat request sends the hardcoded default
+		// (openai/gpt-4o) as a provider/model override and the server rejects
+		// it with "No OpenAI API key has been configured" even though the
+		// assistant is wired to another provider (e.g. Ollama).
+		const bootstrapAssistantId = config.config?.assistantId ?? config.user?.assistant_id ?? 0;
+		const preloadedAssistant = ( config.assistants ?? [] ).find(
+			( a ) => a.id === bootstrapAssistantId,
+		);
+		if ( preloadedAssistant?.provider && preloadedAssistant?.model ) {
+			useModelStore.getState().setModel( {
+				provider: preloadedAssistant.provider,
+				model: preloadedAssistant.model,
+			} );
+		}
+
+		// Seed the chat-profile catalogue + current profile (2.2.0). The
+		// server localizes `profiles` and `config.profile`; the store drives
+		// the selectors and the status-bar readout. Only selectable profiles
+		// are offered in the UI — the server still resolves enforcement.
+		const profiles = config.profiles ?? [];
+		if ( profiles.length > 0 ) {
+			setAvailableProfiles( profiles.filter( ( p ) => p.selectable ) );
+		}
+		if ( typeof config.config?.profile === 'string' && config.config.profile ) {
+			useModelStore.getState().setProfile( config.config.profile );
+		}
+
+		if ( typeof console !== 'undefined' && console.info ) {
+			console.info(
+				'[NV oOS Pro SPA] Initialized',
+				{
+					apiUrl: config.apiUrl,
+					userId: config.user?.id,
+					assistantCount: config.assistants?.length ?? 0,
+				},
+			);
+		}
+
+		// ── Preload vector store info (mirrors legacy chat.js behaviour) ────────
+		const vectorStoreId = config.config?.vectorStoreId;
+		if ( vectorStoreId && typeof console !== 'undefined' && console.info ) {
+			console.info(
+				'[NV oOS Pro SPA] Pre-loading vector store for assistant',
+				{
+					assistantId: config.config?.assistantId,
+					vectorStoreId,
+				},
+			);
+		}
+
+		// ---- seed theme from server config (only when localStorage is empty) ----
+		const serverTheme = config.config?.theme;
+		if (
+			serverTheme &&
+			( serverTheme === 'light' || serverTheme === 'dark' || serverTheme === 'auto' )
+		) {
+			try {
+				if ( ! localStorage.getItem( 'nvoos-pro-spa.theme' ) ) {
+					useUIStore.getState().setTheme( serverTheme );
+				}
+			} catch ( _ ) {
+				// localStorage unavailable — store is already initialised with 'auto'
+			}
+		}
+
+		// Register navigation commands.
+		setCommands( [
+			{
+				id: 'nav-chat',
+				label: 'Go to Chat',
+				description: 'Open the agent chat panel',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/chat';
+				},
+			},
+			{
+				id: 'nav-settings',
+				label: 'Go to Settings',
+				description: 'Open plugin settings',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/settings';
+				},
+			},
+			{
+				id: 'nav-tools',
+				label: 'Go to Tools',
+				description: 'Browse tool registry',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/tools';
+				},
+			},
+			{
+				id: 'nav-assistants',
+				label: 'Go to Assistants',
+				description: 'Manage assistants',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/assistants';
+				},
+			},
+			{
+				id: 'nav-workflows',
+				label: 'Go to Workflows',
+				description: 'Build workflows',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/workflows';
+				},
+			},
+			{
+				id: 'nav-analytics',
+				label: 'Go to Analytics',
+				description: 'View usage dashboard',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/analytics';
+				},
+			},
+			{
+				id: 'nav-knowledge-graph',
+				label: 'Go to Knowledge Graph',
+				description: 'Explore the content graph',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/knowledge-graph';
+				},
+			},
+			{
+				id: 'nav-docs',
+				label: 'Go to Docs',
+				description: 'Browse the documentation',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/docs';
+				},
+			},
+			{
+				id: 'nav-media',
+				label: 'Go to Media Studio',
+				description: 'Open the media editor',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/media';
+				},
+			},
+			{
+				id: 'nav-documents',
+				label: 'Go to Document Editor',
+				description: 'Open the document editor',
+				category: 'navigation',
+				handler: () => {
+					window.location.hash = '#/documents';
+				},
+			},
+			{
+				id: 'action-toggle-sidebar',
+				label: 'Toggle Sidebar',
+				category: 'action',
+				handler: () => {
+					useUIStore.getState().toggleSidebar();
+				},
+			},
+		] );
+
+		setLoading( false );
+	}, [ setCommands ] );
+
+	useEffect( () => {
+		bootstrap();
+	}, [ bootstrap ] );
+
+	return { loading, error, runtime };
+}

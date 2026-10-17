@@ -1,0 +1,248 @@
+/**
+ * Pro SPA v2 — typed runtime config reader.
+ *
+ * Reads `window.NVOOS_PRO_SPA` localized by the PHP admin page enqueue.
+ * Keep this file the single source of truth for the SPA's runtime config shape.
+ */
+
+export interface ProSpaPerInstanceConfig {
+	assistantId?: number;
+	theme?: 'auto' | 'light' | 'dark' | string;
+	allowSensitiveTools?: boolean;
+	/** Vector store ID (mirrors legacy chat.js preloading). */
+	vectorStoreId?: number | string;
+	/**
+	 * Render mode.
+	 * - `admin`: full three-column layout with router (default).
+	 * - `embedded`: chat-first, router-free surface for the [nvoos_pro_spa]
+	 *   shortcode.
+	 */
+	mode?: 'admin' | 'embedded';
+	/** CSS height for embedded instances (e.g. "720px"). */
+	height?: string;
+	/** Guest mode — anonymous visitors authenticated via a guest token. */
+	guest?: boolean;
+	/** Server-minted guest access token sent via X-WP-MCP-AI-Guest. */
+	guestToken?: string;
+	/** Whether embedded mode renders the transcripts sidebar. */
+	showSidebar?: boolean;
+	/**
+	 * Whether embedded mode renders the assistant switcher for logged-in users
+	 * (admin surface for non-admin operators: default; shortcode instances:
+	 * opt-in via assistant_selector="1").
+	 */
+	assistantSelector?: boolean;
+	/**
+	 * Whether the SPA connects to the cron-status job stream on mount
+	 * (blocking SSE + REST poll fallback). Defaults to true. Set false for
+	 * embedded surfaces on constrained hosts (e.g. WordPress Playground),
+	 * where the held-open SSE connection exhausts the worker's request
+	 * budget. Mirrors the [nvoos_pro_spa cron_monitor="0"] attribute.
+	 */
+	cronMonitor?: boolean;
+	/** Route allowlist for the instance (embedded mode: chat only). */
+	routes?: string[];
+	/**
+	 * Resolved chat profile slug governing tool execution (2.2.0).
+	 * Read-only blocks writes, state changes and destructive tools.
+	 */
+	profile?: string;
+	/**
+	 * Whether the chat-profile selector should render for this instance.
+	 * True on the admin surface for logged-in users when the feature is
+	 * enabled server-side.
+	 */
+	profileSelector?: boolean;
+	/**
+	 * True when the shortcode explicitly pins a single assistant (an
+	 * `assistant_id` attribute was provided). Pinned surfaces ignore the
+	 * remembered assistant selection so a stale localStorage value cannot
+	 * silently rebind the conversation to another assistant.
+	 */
+	pinnedAssistant?: boolean;
+}
+
+/** A chat profile as localized by the server (2.2.0). */
+export interface ChatProfileSummary {
+	slug: string;
+	label: string;
+	description: string;
+	/** Whether the current user may select this profile. */
+	selectable: boolean;
+	is_default: boolean;
+}
+
+export interface ProSpaEndpoints {
+	chat: string;
+	chatClient: string;
+	transcripts: string;
+	memory: string;
+	threads: string;
+	tools: string;
+	/** WordPress media upload endpoint (v0.9.0). */
+	upload: string;
+	assistants: string;
+	settings: string;
+	workflows: string;
+	analytics: string;
+	approvals: string;
+	shortcuts: string;
+	slashCommands: string;
+	/** OKF Skills & Knowledge browse endpoint (v2.1.1). */
+	okf: string;
+	/**
+	 * NV oOS Content Graph REST base (nvoos-content-graph/v1) — the
+	 * knowledge-graph explorer page. Empty when the site does not expose
+	 * the plugin, and the page renders an unavailable state.
+	 */
+	contentGraph: string;
+	/**
+	 * NV oOS Docs Hub front-end URL — the #/docs page renders this in a
+	 * sandboxed iframe. Empty when not configured (admin-only), and the
+	 * page renders an unavailable state.
+	 */
+	docsHub: string;
+	/**
+	 * NV oOS Media Studio front-end URL — the #/media page frames this in a
+	 * sandboxed iframe. Empty when not configured (admin-only), and the
+	 * page renders an unavailable state.
+	 */
+	mediaStudio: string;
+	/**
+	 * NV oOS Document Editor front-end URL — the #/documents page frames this
+	 * in a sandboxed iframe. Empty when not configured (admin-only), and the
+	 * page renders an unavailable state.
+	 */
+	documentEditor: string;
+}
+
+export interface RuntimeAssistantSummary {
+	id: number;
+	title: string;
+	provider?: string;
+	model?: string;
+}
+
+export interface ProSpaRuntime {
+	apiUrl: string;
+	proApi: string;
+	nonce: string;
+	config: ProSpaPerInstanceConfig;
+	endpoints: ProSpaEndpoints;
+	user: ProSpaUser;
+	mentionTypes: MentionType[];
+	/** Pre-loaded assistants from the server — avoids a separate REST round-trip. */
+	assistants?: RuntimeAssistantSummary[];
+	/** Chat profile catalogue (2.2.0). */
+	profiles?: ChatProfileSummary[];
+}
+
+export interface ProSpaUser {
+	id: number;
+	login: string;
+	displayName: string;
+	capabilities: string[];
+	assistant_id?: number;
+}
+
+export interface MentionType {
+	type: string;
+	label: string;
+	icon?: string;
+}
+
+export type ProSpaConfig = ProSpaPerInstanceConfig;
+
+/**
+ * Overlay per-instance overrides (the shortcode's data-config JSON) onto the
+ * global runtime and store the result back on `window.NVOOS_PRO_SPA`.
+ *
+ * Every existing consumer (useBootstrap, Layout, ChatPage, useChatSpoke)
+ * reads the runtime through readProSpaConfig(), so writing the merged value
+ * back to the global makes per-instance config transparent to the whole app.
+ *
+ * NOTE: the global is shared — this intentionally supports a single embedded
+ * instance per page (documented shortcode constraint for v1).
+ */
+export function applyPerInstanceConfig( perInstance: unknown ): ProSpaRuntime | null {
+	if ( typeof window === 'undefined' ) {
+		return null;
+	}
+	const runtime = readProSpaConfig();
+	if ( ! runtime ) {
+		return null;
+	}
+	if ( ! perInstance || typeof perInstance !== 'object' || Array.isArray( perInstance ) ) {
+		return runtime;
+	}
+	const overrides = perInstance as Partial< ProSpaPerInstanceConfig >;
+	const next: ProSpaRuntime = {
+		...runtime,
+		config: {
+			...runtime.config,
+			...( overrides as ProSpaPerInstanceConfig ),
+		},
+	};
+	( window as unknown as { NVOOS_PRO_SPA?: ProSpaRuntime } ).NVOOS_PRO_SPA = next;
+	return next;
+}
+
+/**
+ * Read the localized runtime config emitted by `wp_localize_script()`.
+ *
+ * Returns `null` when the global is missing or malformed so the App can render
+ * a graceful fallback instead of throwing.
+ */
+export function readProSpaConfig(): ProSpaRuntime | null {
+	if ( typeof window === 'undefined' ) {
+		return null;
+	}
+	const g = ( window as unknown as { NVOOS_PRO_SPA?: Partial< ProSpaRuntime > } )
+		.NVOOS_PRO_SPA;
+	if ( ! g || typeof g.apiUrl !== 'string' || ! g.endpoints ) {
+		return null;
+	}
+	const e = g.endpoints as Partial< ProSpaEndpoints >;
+	if (
+		typeof e.chatClient !== 'string' ||
+		typeof e.chat !== 'string' ||
+		typeof e.transcripts !== 'string' ||
+		typeof e.threads !== 'string' ||
+		typeof e.tools !== 'string' ||
+		typeof e.assistants !== 'string' ||
+		typeof e.settings !== 'string'
+	) {
+		return null;
+	}
+	return {
+		apiUrl: g.apiUrl,
+		proApi: typeof g.proApi === 'string' ? g.proApi : '',
+		nonce: typeof g.nonce === 'string' ? g.nonce : '',
+		config: ( g.config ?? {} ) as ProSpaPerInstanceConfig,
+		endpoints: {
+			chat: e.chat,
+			chatClient: e.chatClient,
+			transcripts: e.transcripts,
+			memory: typeof e.memory === 'string' ? e.memory : '',
+			threads: e.threads,
+			tools: e.tools,
+			upload: typeof e.upload === 'string' ? e.upload : '',
+			assistants: e.assistants,
+			settings: e.settings,
+			workflows: typeof e.workflows === 'string' ? e.workflows : '',
+			analytics: typeof e.analytics === 'string' ? e.analytics : '',
+			approvals: typeof e.approvals === 'string' ? e.approvals : '',
+			shortcuts: typeof e.shortcuts === 'string' ? e.shortcuts : '',
+			slashCommands: typeof e.slashCommands === 'string' ? e.slashCommands : '',
+			okf: typeof e.okf === 'string' ? e.okf : '',
+			contentGraph: typeof e.contentGraph === 'string' ? e.contentGraph : '',
+			docsHub: typeof e.docsHub === 'string' ? e.docsHub : '',
+			mediaStudio: typeof e.mediaStudio === 'string' ? e.mediaStudio : '',
+			documentEditor: typeof e.documentEditor === 'string' ? e.documentEditor : '',
+		},
+		user: ( g.user ?? { id: 0, login: '', displayName: '', capabilities: [] } ) as ProSpaUser,
+		mentionTypes: Array.isArray( g.mentionTypes ) ? g.mentionTypes : [],
+		assistants: Array.isArray( g.assistants ) ? g.assistants : undefined,
+		profiles: Array.isArray( g.profiles ) ? ( g.profiles as ChatProfileSummary[] ) : undefined,
+	};
+}
