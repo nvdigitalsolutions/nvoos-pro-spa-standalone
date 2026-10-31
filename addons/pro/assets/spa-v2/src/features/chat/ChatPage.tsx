@@ -1,0 +1,959 @@
+/**
+ * ChatPage — Main chat feature page for the Pro SPA v2.
+ *
+ * Route: /chat
+ *
+ * Architecture: **Conversations-first** (matching chat-spa pattern).
+ * The `useTranscripts` hook owns the chat session identity; `useChatSpoke`
+ * binds to `sessionKey` so switching conversations cleanly rebinds.
+ * Threads are a read-only browse view loaded via the sidebar.
+ */
+
+import { useCallback, useEffect, useMemo, useRef, useState, type JSX } from 'react';
+import { type Message } from '@ai-sdk/react';
+import { __, sprintf } from '@wordpress/i18n';
+
+	import { useBootstrap } from '../../hooks/useBootstrap';
+	import { usePermissions } from '../../auth/permissions';
+	import { useChatSpoke } from '../../hooks/useChatSpoke';
+import { useTranscripts } from '../../hooks/useTranscripts';
+import { useKeyboardShortcuts } from '../../hooks/useKeyboardShortcuts';
+import { useSpeechPlayback } from '../../hooks/useSpeechPlayback';
+import { useJobBus } from '../../hooks/useJobBus';
+import { useTabTitleBadge } from '../../hooks/useTabTitleBadge';
+import { useChatProfile } from '../../hooks/useChatProfile';
+import { useModelStore } from '../../stores/modelStore';
+import { useAssistantStore } from '../../stores/assistantStore';
+import { useUIStore } from '../../stores/uiStore';
+import { ThreadsClient } from '../../api/threads';
+import { exportConversation } from '../../utils/export-conversation';
+import { AgentPanel } from './AgentPanel';
+import { MemoryDrawer, type MemoryTab } from '../../components/shared/MemoryDrawer';
+import { HitlApprovalBar } from '../../components/shared/HitlApprovalBar';
+import { ToolShortcutsDrawer } from './ToolShortcutsDrawer';
+import { OkfDrawer } from '../../components/shared/OkfDrawer';
+import { SlashCommandsDrawer } from './SlashCommandsDrawer';
+import { KeyboardShortcutsHelp } from '../../components/shared/KeyboardShortcutsHelp';
+import { SuggestedPrompts } from '../../components/shared/SuggestedPrompts';
+import { TasksDrawer } from '../../components/shared/TasksDrawer';
+import { useWorkflowState, useDelegationNotices } from '../../hooks/useAgentTeam';
+
+export interface ChatPageProps {
+	/** Transcript hook result lifted from Layout. */
+	transcripts: ReturnType< typeof useTranscripts >;
+}
+
+/**
+ * Normalize a slash-command REST result (string, array, or object) to a
+ * displayable string so MessageView can render it safely.
+ *
+ * Exported for unit tests.
+ */
+export function normalizeSlashResult( value: unknown ): string {
+	if ( typeof value === 'string' ) {
+		return value;
+	}
+	if ( Array.isArray( value ) ) {
+		return value
+			.map( ( item ) => {
+				if ( typeof item === 'string' ) return item;
+				try {
+					return JSON.stringify( item, null, 2 );
+				} catch {
+					return String( item );
+				}
+			} )
+			.join( '\n' );
+	}
+	if ( value === null || value === undefined ) {
+		return '';
+	}
+	if ( typeof value === 'object' ) {
+		try {
+			return JSON.stringify( value, null, 2 );
+		} catch {
+			return String( value );
+		}
+	}
+	return String( value );
+}
+
+/**
+ * Focus the composer textarea (used after drawer insertions).
+ */
+function focusComposer(): void {
+	const el = document.getElementById(
+		'nvoos-pro-spa-composer-input'
+	) as HTMLTextAreaElement | null;
+	el?.focus();
+}
+
+export function ChatPage( props: ChatPageProps ): JSX.Element {
+	const { transcripts } = props;
+
+	const { loading: booting, error: bootError, runtime } = useBootstrap();
+
+	const model = useModelStore( ( s ) => s.model );
+	const profile = useModelStore( ( s ) => s.profile );
+	const setModel = useModelStore( ( s ) => s.setModel );
+	const availableModels = useModelStore( ( s ) => s.availableModels );
+	const availableProfiles = useModelStore( ( s ) => s.availableProfiles );
+	const { changeProfile } = useChatProfile();
+
+	// The profile selector renders when the server localized a catalogue and
+	// enabled the surface for this instance (logged-in, feature on). Only
+	// profiles the user may select are listed — the server re-validates.
+	const showProfileSelector = !!runtime?.config?.profileSelector;
+
+	// Deduplicate models by provider|model combo (backend may send duplicates).
+	const uniqueModels = useMemo(
+		() => {
+			const seen = new Set< string >();
+			return availableModels.filter( ( m ) => {
+				const key = `${ m.provider }|${ m.model }`;
+				if ( seen.has( key ) ) {
+					return false;
+				}
+				seen.add( key );
+				return true;
+			} );
+		},
+		[ availableModels ]
+	);
+
+	// Model / profile overrides are an admin concern — assistants carry their
+	// own provider+model configuration, so non-admin operators should pick an
+	// assistant (the sidebar selector) rather than a raw model. Central
+	// capability source (see auth/permissions.ts).
+	const { isAdmin } = usePermissions();
+
+	// Use assistant store for dynamic selection (with runtime config fallback).
+	const storedAssistantId = useAssistantStore( ( s ) => s.assistantId );
+	const assistantId = storedAssistantId > 0 ? storedAssistantId : ( runtime?.config?.assistantId ?? runtime?.user?.assistant_id ?? 0 );
+	const endpoints = runtime?.endpoints;
+	const nonce = runtime?.nonce ?? '';
+	const isGuest = !!runtime?.config?.guest;
+	const guestToken =
+		typeof runtime?.config?.guestToken === 'string' ? runtime.config.guestToken : '';
+
+	// Map transcript messages to AI SDK Message shape (needs `id`).
+		// Preserve the original role so tool messages are properly surfaced;
+		// only system messages are re-mapped to assistant (the AI SDK does not
+		// render system messages).  Spread the original message so annotations
+		// and toolInvocations survive the mapping for CCT-loaded history.
+		const initialMessages = useMemo(
+			() =>
+				transcripts.initialMessages.map( ( m, idx ) => ( {
+					...m,
+					id: `${ transcripts.sessionKey }:${ idx }`,
+					role: ( m.role === 'system' ? 'assistant' : m.role ) as
+						| 'user'
+						| 'assistant'
+						| 'system'
+						| 'data',
+					content: typeof m.content === 'string' ? m.content : '',
+				} ) ),
+			[ transcripts.initialMessages, transcripts.sessionKey ]
+		);
+
+	// ---- Chat spoke (conversation-driven) ----
+	// sessionKey owns the useChat `id` — switching conversations rebinds cleanly.
+	const chatSpoke = useChatSpoke( {
+		chatClientEndpoint: endpoints?.chatClient ?? '',
+		nonce,
+		assistantId,
+		initialMessages,
+		sessionKey: transcripts.sessionKey,
+		model: model.model,
+		provider: model.provider,
+		transcriptsEndpoint: endpoints?.transcripts ?? '',
+		allowSensitiveTools: !!runtime?.config?.allowSensitiveTools,
+		guest: !!runtime?.config?.guest,
+		guestToken:
+			typeof runtime?.config?.guestToken === 'string'
+				? runtime.config.guestToken
+				: '',
+	} );
+
+	const {
+		messages,
+		input,
+		handleInputChange,
+		handleSubmit,
+		status,
+		error: chatError,
+		stop,
+		reload,
+		isStreaming,
+		sendMessage,
+		usageMap,
+		handleSubmitWithAttachments,
+		saveConversation,
+		setMessages,
+	} = chatSpoke;
+
+	// The restored conversation's history is fetched after this component has
+	// mounted, so `useChat` has already bound its (then empty) initialMessages.
+	// Push the history in once it arrives — once per conversation, and never
+	// over messages already on screen (an in-flight stream, or a history the
+	// user has since pruned).
+	const hydratedSessionRef = useRef< string >( '' );
+	useEffect( () => {
+		if ( initialMessages.length === 0 || messages.length > 0 ) {
+			return;
+		}
+		if ( hydratedSessionRef.current === transcripts.sessionKey ) {
+			return;
+		}
+		hydratedSessionRef.current = transcripts.sessionKey;
+		setMessages( initialMessages );
+	}, [ initialMessages, messages.length, setMessages, transcripts.sessionKey ] );
+
+	// ── Slash command execution (v2.1.0, composer intercept v2.2.x) ─────
+	// Appends the user echo + server result/error to the transcript.
+	// Uses functional setMessages updates so concurrent appends can't
+	// drop messages (fixes the v2.1.0 stale-closure bug).
+	const handleExecuteSlashCommand = useCallback(
+		async ( _cmd: string, rawInput: string ) => {
+			if ( ! endpoints?.slashCommands ) return;
+
+			const executeUrl = `${ endpoints.slashCommands.replace( /\/+$/, '' ) }/execute`;
+
+			const userMessage = {
+				id: `slash-usr-${ Date.now() }`,
+				role: 'user' as const,
+				content: rawInput,
+			};
+			setMessages( ( prev ) => [ ...prev, userMessage as Message ] );
+
+			try {
+				const executeHeaders: Record< string, string > = {
+					'Content-Type': 'application/json',
+				};
+				if ( isGuest ) {
+					executeHeaders[ 'X-WP-MCP-AI-Guest' ] = guestToken || '1';
+				} else if ( nonce ) {
+					executeHeaders[ 'X-WP-Nonce' ] = nonce;
+				}
+
+				const resp = await fetch( executeUrl, {
+					method: 'POST',
+					credentials: 'same-origin',
+					headers: executeHeaders,
+					body: JSON.stringify( { command: rawInput } ),
+				} );
+
+				if ( ! resp.ok ) {
+					const errData = await resp.json().catch( () => ( {} ) );
+					throw new Error(
+						( errData as { message?: string } ).message ||
+							`HTTP ${ resp.status }`,
+					);
+				}
+
+				const data = ( await resp.json() ) as {
+					success?: boolean;
+					result?: unknown;
+					message?: string;
+				};
+
+				const resultText =
+					normalizeSlashResult( data.result ?? data.message ) ||
+					__( 'Command executed successfully.', 'nvoos-pro-spa' );
+
+				const assistantMessage = {
+					id: `slash-asst-${ Date.now() }`,
+					role: 'assistant' as const,
+					content: resultText,
+				};
+				setMessages( ( prev ) => [
+					...prev,
+					assistantMessage as Message,
+				] );
+			} catch ( err: unknown ) {
+				const errorText =
+					( err as Error )?.message ??
+					__( 'Command execution failed.', 'nvoos-pro-spa' );
+				const errorMessage = {
+					id: `slash-err-${ Date.now() }`,
+					role: 'assistant' as const,
+					content: `\u274C ${ errorText }`,
+				};
+				setMessages( ( prev ) => [
+					...prev,
+					errorMessage as Message,
+				] );
+				throw err;
+			}
+		},
+		[ endpoints?.slashCommands, nonce, isGuest, guestToken, setMessages ],
+	);
+
+	// ── Composer slash-command submit (v2.2.x) ─────────────────────────
+	// AgentPanel routes "/"-prefixed inputs here. The error is already
+	// rendered as a chat message, so we swallow the rejection to avoid
+	// unhandled promise rejections.
+	const [ slashBusy, setSlashBusy ] = useState( false );
+	const handleComposerSubmit = useCallback(
+		( rawInput: string ): Promise< void > => {
+			if ( ! endpoints?.slashCommands ) {
+				return Promise.resolve();
+			}
+			setSlashBusy( true );
+			return handleExecuteSlashCommand( rawInput, rawInput )
+				.catch( () => {
+					// Error message already appended to the chat transcript.
+				} )
+				.finally( () => setSlashBusy( false ) );
+		},
+		[ endpoints?.slashCommands, handleExecuteSlashCommand ],
+	);
+
+	// Enhance usageMap with cost/model data extracted from "data"
+	// annotations that arrive via the SSE adapter's type-8 frames.
+	const enhancedUsageMap = useMemo( () => {
+		const map = { ...usageMap };
+		for ( const msg of messages ) {
+			const anns = Array.isArray( ( msg as unknown as Record< string, unknown > ).annotations )
+				? ( msg as unknown as Record< string, unknown > ).annotations as Array< Record< string, unknown > >
+				: [];
+			for ( const ann of anns ) {
+				if ( ann.type === 'data' && ann.data && typeof ann.data === 'object' ) {
+					const d = ann.data as Record< string, unknown >;
+					// Cost may be nested inside ann.data (from done/finish
+					// annotations or the re-wrapped SSE adapter path) or
+					// at ann's top level (from raw message frames).
+					// Check both locations so cost badges never go missing.
+					const costFromData = d.cost as Record< string, unknown > | undefined;
+					const costFromAnn = ann.cost as Record< string, unknown > | undefined;
+					const cost = costFromData || costFromAnn;
+					const usage = d.usage as Record< string, unknown > | undefined;
+					const existing = map[ msg.id ] || {};
+					if ( ! existing.costUsd && cost && typeof cost.cost_usd === 'number' ) {
+						existing.costUsd = cost.cost_usd as number;
+					}
+					if ( ! existing.totalTokens && usage && typeof usage.total_tokens === 'number' ) {
+						existing.totalTokens = usage.total_tokens as number;
+					}
+					if ( ! existing.promptTokens && usage && typeof usage.prompt_tokens === 'number' ) {
+						existing.promptTokens = usage.prompt_tokens as number;
+					}
+					if ( ! existing.completionTokens && usage && typeof usage.completion_tokens === 'number' ) {
+						existing.completionTokens = usage.completion_tokens as number;
+					}
+					if ( ! existing.model && typeof d.model === 'string' && d.model ) {
+						existing.model = d.model as string;
+					}
+					if ( ! existing.provider && typeof d.provider === 'string' && d.provider ) {
+						existing.provider = d.provider as string;
+					}
+					map[ msg.id ] = existing;
+				}
+			}
+		}
+		return map;
+	}, [ usageMap, messages ] );
+		// ── Refresh sidebar after each completed response ──
+		// The server-side WP_MCP_AI_Chat_Transcript_Recorder auto-saves
+		// transcripts during every chat request, and tool-generated files
+		// (images, videos) land in the Media Library during the agentic
+		// loop.  Bump both refresh signals so the sidebar thread list
+		// and media tab re-fetch after the stream ends.
+		const bumpMediaRefresh = useUIStore( ( s ) => s.bumpMediaRefresh );
+		const prevStreamingRef = useRef( isStreaming );
+		useEffect( () => {
+			const wasStreaming = prevStreamingRef.current;
+			prevStreamingRef.current = isStreaming;
+			// Transition from streaming → ready: the LLM has finished and
+			// the server-side transcript + media should now be persisted.
+			if ( wasStreaming && ! isStreaming && status === 'ready' ) {
+				// Small delay to give the server-side recorder a chance to
+				// finish writing before we re-fetch both lists.
+				const timer = setTimeout( () => {
+					void transcripts.refreshList();
+					bumpMediaRefresh();
+				}, 500 );
+				return () => clearTimeout( timer );
+			}
+		}, [ isStreaming, status, transcripts, bumpMediaRefresh ] );
+
+	// Watch for media insert events from the sidebar Media tab.
+	// When the user clicks "Insert into chat", append attachment ID
+	// references to the composer so the image is easily referenced.
+	const mediaInsert = useUIStore( ( s ) => s.mediaInsert );
+	const clearMediaInsert = useUIStore( ( s ) => s.clearMediaInsert );
+	useEffect( () => {
+		if ( ! mediaInsert || mediaInsert.length === 0 ) {
+			return;
+		}
+		const refs = mediaInsert.map( ( id ) => `[attachment:${ id }]` ).join( ' ' );
+
+		// Programmatically set the composer value and fire an input event
+		// so useChat/AI SDK's internal state stays in sync.
+		const composer = document.getElementById( 'nvoos-pro-spa-composer-input' ) as HTMLTextAreaElement | null;
+		if ( composer ) {
+			const nativeSetter = Object.getOwnPropertyDescriptor(
+				window.HTMLTextAreaElement.prototype,
+				'value'
+			)?.set;
+			if ( nativeSetter ) {
+				const current = composer.value || '';
+				const newValue = current ? `${ current } ${ refs }` : refs;
+				nativeSetter.call( composer, newValue );
+				composer.dispatchEvent( new Event( 'input', { bubbles: true } ) );
+				composer.focus();
+			}
+		}
+
+		clearMediaInsert();
+	}, [ mediaInsert, clearMediaInsert ] );
+
+	// ---- Thread read‑only state (populated by ChatSidebar) ----
+	// When the sidebar selects a thread, LayoutContent calls
+	// chatSpoke.setMessages() with the thread's messages and sets
+	// activeThreadId. Those messages are treated as a read‑only view;
+	// the chat transport stays on /chat-client.
+
+	const handleRegenerate = useCallback( () => {
+		reload();
+	}, [ reload ] );
+
+	// ---- Memory drawer ----
+	const [ memoryOpen, setMemoryOpen ] = useState< boolean >( false );
+	const [ memoryTab, setMemoryTab ] = useState< MemoryTab >( 'memories' );
+	const memoryToggleRef = useRef< HTMLButtonElement | null >( null );
+
+	// ---- Tool Shortcuts drawer ----
+	const [ toolsOpen, setToolsOpen ] = useState< boolean >( false );
+	const toolsToggleRef = useRef< HTMLButtonElement | null >( null );
+
+	// ---- Slash Commands drawer ----
+	const [ commandsOpen, setCommandsOpen ] = useState< boolean >( false );
+	const commandsToggleRef = useRef< HTMLButtonElement | null >( null );
+
+	// ---- Tasks drawer ----
+	const [ tasksOpen, setTasksOpen ] = useState< boolean >( false );
+	const tasksToggleRef = useRef< HTMLButtonElement | null >( null );
+
+	// ---- Skills & OKF knowledge drawer (v2.1.1) ----
+	const [ okfOpen, setOkfOpen ] = useState< boolean >( false );
+	const okfToggleRef = useRef< HTMLButtonElement | null >( null );
+
+	// ---- Chat toolbar collapse (v2.2.0) ----
+	// The top toolbar collapses to a single row (model selector + toggle);
+	// expanding reveals the extra controls in the same top area. The toggle
+	// is pinned to the top-right of the bar via CSS so the close icon stays
+	// put. The embedded widget keeps the full bar via CSS.
+	const [ toolbarOpen, setToolbarOpen ] = useState< boolean >( false );
+	const toggleToolbar = useCallback( () => {
+		setToolbarOpen( ( open ) => ! open );
+	}, [] );
+
+	// Shared callback: close one drawer when another opens.
+	const openDrawer = useCallback(
+		( which: 'memory' | 'tools' | 'commands' | 'tasks' | 'okf' ) => {
+			setMemoryOpen( which === 'memory' );
+			setToolsOpen( which === 'tools' );
+			setCommandsOpen( which === 'commands' );
+			setTasksOpen( which === 'tasks' );
+			setOkfOpen( which === 'okf' );
+		},
+		[]
+	);
+
+	// ---- Feedback state ----
+	const [ feedbackState, setFeedbackState ] = useState< Record< string, 'up' | 'down' > >( {} );
+
+	const handleDeleteMessage = useCallback(
+		( msgId: string ) => {
+			chatSpoke.setMessages( messages.filter( ( m: Message ) => m.id !== msgId ) );
+		},
+		[ messages, chatSpoke ]
+	);
+
+	const handleFeedback = useCallback(
+		( msgId: string, rating: 'up' | 'down' ) => {
+			setFeedbackState( ( prev ) => {
+				if ( prev[ msgId ] === rating ) {
+					const next = { ...prev };
+					delete next[ msgId ];
+					return next;
+				}
+				return { ...prev, [ msgId ]: rating };
+			} );
+		},
+		[]
+	);
+
+	const handleEditMessage = useCallback(
+		( msgId: string ) => {
+			const idx = messages.findIndex( ( m ) => m.id === msgId );
+			if ( idx < 0 ) return;
+			const msg = messages[ idx ];
+			if ( msg.role !== 'user' ) return;
+			chatSpoke.setMessages( messages.slice( 0, idx ) );
+			const content = typeof msg.content === 'string' ? msg.content : '';
+			// Fire a synthetic input event to update the composer.
+			const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+				window.HTMLTextAreaElement.prototype,
+				'value'
+			)?.set;
+			const inputEl = document.getElementById(
+				'nvoos-pro-spa-composer-input'
+			) as HTMLTextAreaElement | null;
+			if ( inputEl && nativeInputValueSetter ) {
+				nativeInputValueSetter.call( inputEl, content );
+				inputEl.dispatchEvent( new Event( 'input', { bubbles: true } ) );
+				inputEl.focus();
+			}
+		},
+		[ messages, chatSpoke ]
+	);
+
+	const hasMemory = typeof endpoints?.memory === 'string' && endpoints.memory.length > 0;
+	const hasApprovals = typeof endpoints?.approvals === 'string' && endpoints.approvals.length > 0;
+	const hasShortcuts = typeof endpoints?.shortcuts === 'string' && endpoints.shortcuts.length > 0;
+	const hasSlashCommands = typeof endpoints?.slashCommands === 'string' && endpoints.slashCommands.length > 0;
+	const hasOkf = typeof endpoints?.okf === 'string' && endpoints.okf.length > 0;
+
+	// ── Console: Slash Commands (v2.1.1 — mirrors legacy slash-commands.js) ───
+	useEffect( () => {
+		if ( hasSlashCommands && typeof console !== 'undefined' && console.info ) {
+			console.info(
+				'[NV oOS Pro SPA] SlashCommands endpoint registered',
+				{
+					endpoint: endpoints?.slashCommands,
+					assistantId,
+				},
+			);
+		}
+	}, [ hasSlashCommands, endpoints?.slashCommands, assistantId ] );
+
+	// ── Keyboard shortcuts (v0.9.0) ────────────────────────────────────────────
+	const ks = useKeyboardShortcuts( {
+		onExport: () => { if ( messages.length > 0 ) exportConversation( messages, 'json', assistantId, transcripts.sessionKey ); },
+		onNewChat: () => transcripts.startNewSession(),
+	} );
+
+	// ── Speech playback (v0.9.0) ──────────────────────────────────────────────
+	const speech = useSpeechPlayback( { toolsEndpoint: endpoints?.tools ?? '', nonce, assistantId } );
+
+	// ── Job system (v0.9.0) ───────────────────────────────────────────────────
+	// When the per-instance config disables cron monitoring (embedded mode on
+	// constrained hosts, e.g. WordPress Playground), pass an empty base URL so
+	// useJobBus() skips BOTH the blocking SSE cron-status stream and the REST
+	// poll fallback on mount.
+	const cronMonitorEnabled = runtime?.config?.cronMonitor !== false;
+	const cronBase = cronMonitorEnabled
+		? ( endpoints?.chat ?? '' ).replace( /\/chat\/?$/, '' )
+		: '';
+	const jobBus = useJobBus( cronBase, nonce );
+	useTabTitleBadge( jobBus.runningCount );
+
+	// ── Dark mode (v0.9.0) — uses existing uiStore ────────────────────────────
+	const theme = useUIStore( ( s ) => s.theme );
+	const setTheme = useUIStore( ( s ) => s.setTheme );
+
+	// ── Workflow + delegation (v0.9.0) ─────────────────────────────────
+	const workflowState = useWorkflowState( messages );
+	const delegationNotices = useDelegationNotices( messages );
+
+	// ── Bridge delegation results to job bus so they appear in Tasks drawer ────
+	// delegate_to_agent is synchronous (no cron job), so we create pseudo-job
+	// entries from the tool result so the user can see delegation activity.
+	const bridgedDelegations = useRef< Set< string > >( new Set() );
+	useEffect( () => {
+		const bus = ( window as unknown as { wpMcpAiJobBus?: EventTarget } )
+			.wpMcpAiJobBus;
+		if ( ! bus ) return;
+
+		for ( const notice of delegationNotices ) {
+			const key = `${ notice.agentName || 'agent' }::${ notice.task }`;
+			if ( bridgedDelegations.current.has( key ) ) continue;
+			bridgedDelegations.current.add( key );
+
+			const status =
+				notice.status === 'complete' || notice.status === 'completed'
+					? 'completed'
+					: notice.status === 'error' || notice.status === 'failed'
+					? 'failed'
+					: 'running';
+
+			bus.dispatchEvent(
+				new CustomEvent( 'job:started', {
+					detail: {
+						job_id: `delegation-${ notice.agentName || 'agent' }`,
+						tool_name: `Delegate to ${ notice.agentName || 'agent' }`,
+						status,
+						message: notice.task,
+					},
+				} )
+			);
+		}
+	}, [ delegationNotices ] );
+
+	// ---- Render ----
+
+	if ( booting ) {
+		return (
+			<div
+				className="nvoos-pro-spa-chat-page nvoos-pro-spa-chat-page--loading"
+				role="status"
+				aria-label={ __( 'Loading chat', 'nvoos-pro-spa' ) }
+			>
+				<div className="nvoos-pro-spa-chat-page__spinner" aria-hidden="true" />
+				<p className="nvoos-pro-spa-chat-page__loading-text">
+					{ __( 'Loading…', 'nvoos-pro-spa' ) }
+				</p>
+			</div>
+		);
+	}
+
+	if ( bootError ) {
+		return (
+			<div
+				className="nvoos-pro-spa-chat-page nvoos-pro-spa-chat-page--error"
+				role="alert"
+			>
+				<p className="nvoos-pro-spa-chat-page__error-text">
+					{ sprintf(
+						/* translators: %s: error message */
+						__( 'Failed to initialize chat: %s', 'nvoos-pro-spa' ),
+						bootError
+					) }
+				</p>
+			</div>
+		);
+	}
+
+	// Always render the chat surface — conversations own the transport.
+	return (
+		<div
+			className="nvoos-pro-spa-chat-page nvoos-pro-spa-chat-page--active"
+			role="main"
+			aria-label={ __( 'Chat conversation', 'nvoos-pro-spa' ) }
+		>
+			<div
+				id="nvoos-pro-spa-chat-toolbar"
+				className={ [
+					'nvoos-pro-spa-chat-page__toolbar',
+					toolbarOpen
+						? 'nvoos-pro-spa-chat-page__toolbar--open'
+						: '',
+				]
+					.filter( Boolean )
+					.join( ' ' ) }
+			>
+				{/* Model selector — admin only */}
+				{ isAdmin && uniqueModels.length > 0 && (
+					<div className="nvoos-pro-spa-chat-page__model-select">
+						<label
+							htmlFor="nvoos-pro-spa-model-select"
+							className="nvoos-pro-spa-chat-page__select-label"
+						>
+							{ __( 'Model', 'nvoos-pro-spa' ) }
+						</label>
+						<select
+							id="nvoos-pro-spa-model-select"
+							className="nvoos-pro-spa-chat-page__select"
+							value={ `${ model.provider }|${ model.model }` }
+							onChange={ ( e ) => {
+								const [ provider, modelName ] = e.target.value.split( '|' );
+								if ( provider && modelName ) {
+									setModel( { provider, model: modelName } );
+								}
+							} }
+						>
+							{ uniqueModels.map( ( m ) => (
+								<option
+									key={ `${ m.provider }|${ m.model }` }
+									value={ `${ m.provider }|${ m.model }` }
+								>
+									{ m.provider } / { m.model }
+								</option>
+							) ) }
+						</select>
+					</div>
+				) }
+
+					{/* Profile selector (2.2.0) — rendered for logged-in users on
+					    surfaces where the server enables it; only profiles the
+					    user may select are listed. */}
+					{ showProfileSelector && availableProfiles.length > 0 && (
+						<div className="nvoos-pro-spa-chat-page__profile-select nvoos-pro-spa-chat-toolbar-extra">
+							<label
+								htmlFor="nvoos-pro-spa-profile-select"
+								className="nvoos-pro-spa-chat-page__select-label"
+							>
+								{ __( 'Profile', 'nvoos-pro-spa' ) }
+							</label>
+							<select
+								id="nvoos-pro-spa-profile-select"
+								className="nvoos-pro-spa-chat-page__select"
+								value={ profile }
+								onChange={ ( e ) => void changeProfile( e.target.value ) }
+							>
+								{ availableProfiles.map( ( p ) => (
+									<option key={ p.slug } value={ p.slug }>
+										{ p.label }
+									</option>
+								) ) }
+							</select>
+						</div>
+					) }
+
+				{/* Memory drawer toggle */}
+				{ hasMemory && (
+					<button
+						type="button"
+						ref={ memoryToggleRef }
+						className="nvoos-pro-spa-chat-page__memory-btn nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+						onClick={ () => openDrawer( 'memory' ) }
+						aria-label={ __( 'Toggle memory drawer', 'nvoos-pro-spa' ) }
+						aria-expanded={ memoryOpen }
+					>
+						{ __( 'Memory', 'nvoos-pro-spa' ) }
+											</button>
+										) }
+
+										{/* Tool Shortcuts drawer toggle */}
+										{ hasShortcuts && (
+											<button
+												type="button"
+												ref={ toolsToggleRef }
+												className="nvoos-pro-spa-chat-page__tools-btn nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+												onClick={ () => openDrawer( 'tools' ) }
+												aria-label={ __( 'Toggle tool shortcuts drawer', 'nvoos-pro-spa' ) }
+												aria-expanded={ toolsOpen }
+											>
+												{ __( 'Tools', 'nvoos-pro-spa' ) }
+											</button>
+										) }
+
+										{/* Slash Commands drawer toggle */}
+										{ hasSlashCommands && (
+											<button
+												type="button"
+												ref={ commandsToggleRef }
+												className="nvoos-pro-spa-chat-page__commands-btn nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+												onClick={ () => openDrawer( 'commands' ) }
+												aria-label={ __( 'Toggle slash commands drawer', 'nvoos-pro-spa' ) }
+												aria-expanded={ commandsOpen }
+											>
+												{ __( 'Commands', 'nvoos-pro-spa' ) }
+											</button>
+										) }
+										{/* Tasks drawer toggle (v0.9.0) */}
+										<button
+											type="button"
+											ref={ tasksToggleRef }
+											className="nvoos-pro-spa-chat-page__tasks-btn nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+											onClick={ () => openDrawer( 'tasks' ) }
+											aria-label={ __( 'Toggle tasks drawer', 'nvoos-pro-spa' ) }
+											aria-expanded={ tasksOpen }
+										>
+											{ __( 'Tasks', 'nvoos-pro-spa' ) }
+											{ jobBus.runningCount > 0 && (
+												<span className="nvoos-pro-spa-tasks-badge">
+													{ jobBus.runningCount }
+												</span>
+											) }
+											{ jobBus.failedCount > 0 && jobBus.runningCount === 0 && (
+												<span className="nvoos-pro-spa-tasks-badge nvoos-pro-spa-tasks-badge--error">!</span>
+											) }
+										</button>
+										{/* Skills & OKF knowledge drawer toggle (v2.1.1) */}
+										{ hasOkf && (
+											<button
+												type="button"
+												ref={ okfToggleRef }
+												className="nvoos-pro-spa-chat-page__okf-btn nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+												onClick={ () => openDrawer( 'okf' ) }
+												aria-label={ __( 'Toggle skills & knowledge drawer', 'nvoos-pro-spa' ) }
+												aria-expanded={ okfOpen }
+											>
+												{ __( 'Skills', 'nvoos-pro-spa' ) }
+											</button>
+										) }
+										{/* Theme toggle (v0.9.0) */}
+										<button type="button" className="nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+											onClick={ () => setTheme( theme === 'dark' ? 'light' : 'dark' ) }
+											aria-label={ theme === 'dark' ? __( 'Light mode', 'nvoos-pro-spa' ) : __( 'Dark mode', 'nvoos-pro-spa' ) }>
+											{ theme === 'dark' ? '☀️' : '🌙' }
+										</button>
+										{/* Export (v0.9.0) */}
+										<button type="button" className="nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+											disabled={ messages.length === 0 }
+											onClick={ () => exportConversation( messages, 'json', assistantId, transcripts.sessionKey ) }
+											aria-label={ __( 'Export conversation', 'nvoos-pro-spa' ) }>
+											📥
+										</button>
+										{/* Keyboard shortcuts (v0.9.0) */}
+										<button type="button" className="nvoos-pro-spa-btn nvoos-pro-spa-chat-toolbar-extra"
+											onClick={ ks.toggleHelp }
+											aria-label={ __( 'Keyboard shortcuts', 'nvoos-pro-spa' ) }>
+											⌨
+										</button>
+										{/* Collapse/expand toggle — the single extra control on
+										    every surface (hidden for the embedded widget). */}
+										<button
+											type="button"
+											className="nvoos-pro-spa-chat-toolbar-toggle"
+											onClick={ toggleToolbar }
+											aria-label={
+												toolbarOpen
+													? __( 'Hide chat controls', 'nvoos-pro-spa' )
+													: __( 'Show chat controls', 'nvoos-pro-spa' )
+											}
+											aria-expanded={ toolbarOpen }
+											aria-controls="nvoos-pro-spa-chat-toolbar"
+										>
+											{ toolbarOpen ? '✕' : '⚙' }
+											</button>
+										</div>
+
+			{/* HITL approval bar — the approval queue is manage_options-only
+			    server-side (list + resolve), so non-admin roles would only ever
+			    poll a 403. Mount it for admins only. */}
+			{ isAdmin && hasApprovals && (
+				<HitlApprovalBar
+					endpoint={ endpoints!.approvals }
+					nonce={ nonce }
+					assistantId={ assistantId }
+					sessionId={ transcripts.sessionKey }
+					isStreaming={ isStreaming }
+				/>
+			) }
+
+			{/* Suggested prompts (GAP-07: v0.9.0) */}
+			<SuggestedPrompts
+				prompts={ ( runtime?.config as Record< string, unknown > )?.suggestedPrompts as string[] | undefined }
+				onSelect={ ( prompt ) => sendMessage( prompt ) }
+			/>
+
+			<AgentPanel
+				messages={ messages }
+				input={ input }
+				handleInputChange={ handleInputChange }
+				handleSubmit={ handleSubmit }
+				status={ status }
+				error={ chatError }
+				stop={ stop }
+				reload={ reload }
+				isStreaming={ isStreaming }
+				sendMessage={ sendMessage }
+				threadId={ 0 }
+				threadTitle={ '' }
+				onRegenerate={ handleRegenerate }
+				onDeleteMessage={ handleDeleteMessage }
+				onFeedback={ handleFeedback }
+				onEditMessage={ handleEditMessage }
+				feedbackState={ feedbackState }
+				usageMap={ enhancedUsageMap }
+				onSpeechPlay={ ( t ) => void speech.play( t ) }
+				onSpeechStop={ speech.stop }
+				speechStateFor={ speech.stateFor }
+				jobs={ jobBus.jobs }
+				onCancelJob={ ( id ) => void jobBus.cancelJob( id ) }
+				onRetryJob={ ( id ) => void jobBus.retryJob( id ) }
+				workflow={ workflowState }
+				delegations={ delegationNotices }
+				toolsEndpoint={ endpoints?.tools }
+				uploadEndpoint={ endpoints?.upload }
+				nonce={ nonce }
+				assistantId={ assistantId }
+				onSubmitWithAttachments={ ( atts ) => handleSubmitWithAttachments( atts ) }
+				onSaveConversation={ saveConversation }
+				slashCommandsEndpoint={ endpoints?.slashCommands }
+				onSubmitSlashCommand={ endpoints?.slashCommands ? handleComposerSubmit : undefined }
+				isBusy={ slashBusy }
+			/>
+
+			{/* Memory drawer */}
+			{ hasMemory && (
+				<MemoryDrawer
+					endpoint={ endpoints!.memory }
+					nonce={ nonce }
+					assistantId={ assistantId }
+					isOpen={ memoryOpen }
+					activeTab={ memoryTab }
+					onTabChange={ setMemoryTab }
+					onClose={ () => setMemoryOpen( false ) }
+					toggleRef={ memoryToggleRef }
+				/>
+			) }
+
+			{/* Tool Shortcuts drawer */}
+			{ hasShortcuts && (
+				<ToolShortcutsDrawer
+					endpoint={ endpoints!.shortcuts }
+					nonce={ nonce }
+					assistantId={ assistantId }
+					isOpen={ toolsOpen }
+					onClose={ () => setToolsOpen( false ) }
+					guest={ isGuest }
+					guestToken={ guestToken }
+					onInsertPayload={ sendMessage }
+					toggleRef={ toolsToggleRef }
+				/>
+			) }
+
+			{/* Slash Commands drawer */}
+			{ hasSlashCommands && (
+				<SlashCommandsDrawer
+					endpoint={ endpoints!.slashCommands }
+					nonce={ nonce }
+					isOpen={ commandsOpen }
+					onClose={ () => setCommandsOpen( false ) }
+					guest={ isGuest }
+					guestToken={ guestToken }
+					onInsertPayload={ ( payload: string ) => {
+						// Insert into the composer (not send) so the user can
+						// fill required arguments before executing.
+						handleInputChange( payload );
+						focusComposer();
+					} }
+					onExecuteCommand={ ( cmd, raw ) => handleExecuteSlashCommand( cmd, raw ) }
+					toggleRef={ commandsToggleRef }
+				/>
+			) }
+
+			{/* Tasks drawer (v0.9.0) */}
+			<TasksDrawer
+				jobs={ jobBus.jobs }
+				runningCount={ jobBus.runningCount }
+				isOpen={ tasksOpen }
+				onClose={ () => setTasksOpen( false ) }
+				toggleRef={ tasksToggleRef }
+				onCancelJob={ jobBus.cancelJob }
+				onRetryJob={ jobBus.retryJob }
+				onDismissJob={ jobBus.dismissJob }
+				onDismissAll={ jobBus.dismissAllTerminal }
+			/>
+
+			{/* Skills & OKF knowledge drawer (v2.1.1) */}
+			{ hasOkf && (
+				<OkfDrawer
+					endpoint={ endpoints!.okf }
+					nonce={ nonce }
+					assistantId={ assistantId }
+					isOpen={ okfOpen }
+					onClose={ () => setOkfOpen( false ) }
+					guest={ isGuest }
+					guestToken={ guestToken }
+					onInsertPrompt={ ( prompt, autoSubmit ) => {
+						if ( autoSubmit ) {
+							sendMessage( prompt );
+						} else {
+							handleInputChange( prompt );
+						}
+					} }
+					toggleRef={ okfToggleRef }
+				/>
+			) }
+
+		{/* Keyboard shortcuts help modal (v0.9.0) */}
+		<KeyboardShortcutsHelp isOpen={ ks.isHelpOpen } onClose={ ks.closeHelp } />
+		</div>
+	);
+	}
